@@ -1,0 +1,62 @@
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: Check state of MariaDB service
+      service_facts:
+      register: services_state
+
+    - name: Assert MariaDB is started on all nodes
+      assert:
+        that: services_state.ansible_facts.services['mariadb.service'].state == "running"
+
+    - name: Record wsrep_cluster_status from nodes
+      become: true
+      shell: mariadb -NBe "SHOW GLOBAL STATUS LIKE 'wsrep_cluster_status';" | awk '{ print $2 }'
+      register: wsrep_cluster_status_result
+      changed_when: false
+      check_mode: false
+
+    - name: Set wsrep_cluster_status fact
+      set_fact:
+        wsrep_cluster_status: "{{ wsrep_cluster_status_result.stdout }}"
+
+    - name: assert quorum is lost
+      assert:
+        that: "{{ groups[galera_cluster_group] | map('extract', hostvars, 'wsrep_cluster_status') | select('==', 'Primary') | list | length == 0 }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Record wsrep_last_commited from nodes
+      become: true
+      shell: mariadb -NBe "SHOW STATUS LIKE 'wsrep_last_committed';" | awk '/seqno/ { print $2 }'
+      register: wsrep_last_commited_result
+      changed_when: false
+      check_mode: false
+
+    - name: Set wsrep_last_commited fact
+      set_fact:
+        wsrep_last_commited: "{{ wsrep_last_commited_result.stdout | int }}"
+
+    - name: Set most_advanced_node fact
+      set_fact:
+        most_advanced_node: "{{ groups[galera_cluster_group] | sort('wsrep_last_commited' | int) | last }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Enable automatic bootstrap
+      become: true
+      command: mariadb -e "SET GLOBAL wsrep_provider_options='pc.bootstrap=YES';"
+      when: inventory_hostname == most_advanced_node
+
+
+    - name: Record wsrep_cluster_status from nodes
+      become: true
+      shell: mariadb -NBe "SHOW GLOBAL STATUS LIKE 'wsrep_cluster_status';" | awk '{ print $2 }'
+      register: wsrep_cluster_status_result
+      changed_when: false
+      check_mode: false
+
+    - name: debug
+      debug:
+        msg: "{{ wsrep_cluster_status_result }}"
+

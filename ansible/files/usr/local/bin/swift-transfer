@@ -1,0 +1,13 @@
+#!/bin/bash
+
+set -e
+set -u
+set -x
+
+source /home/mysql/openrc
+
+basedir=/var/mariadb
+sourcedir="${basedir}/$(ls -1rt "${basedir}" | tail -1)"
+target_name="$(basename "${sourcedir}")"
+swift upload "${target_name}" "${sourcedir}"
+

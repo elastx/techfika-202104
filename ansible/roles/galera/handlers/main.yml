@@ -1,0 +1,6 @@
+- name: Restart MariaDB
+  become: true
+  throttle: 1
+  service:
+    name: mariadb
+    state: restarted

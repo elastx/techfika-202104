@@ -1,0 +1,252 @@
+---
+- name: Partition MariaDB volume
+  become: true
+  parted:
+    device: /dev/vdb
+    number: 1
+    state: present
+
+- name: Create filesystem on MariaDB volume
+  become: true
+  filesystem:
+    dev: /dev/vdb1
+    fstype: ext4
+
+- name: Mount MariaDB volume
+  become: true
+  mount:
+    src: /dev/vdb1
+    path: /var/lib/mysql
+    opts: noatime
+    state: mounted
+    fstype: ext4
+
+- name: Install packages
+  become: true
+  apt:
+    name:
+      - python3-mysqldb
+      - socat
+      - software-properties-common
+      - ufw
+    state: present
+    update_cache: yes
+
+- name: Add key for Galera repo
+  become: true
+  apt_key:
+    url: https://mariadb.org/mariadb_release_signing_key.asc
+
+- name: Add Galera repo
+  become: true
+  apt_repository:
+    repo: deb [arch=amd64] https://mirrors.dotsrc.org/mariadb/repo/10.5/ubuntu focal main
+
+- name: Install packages
+  become: true
+  apt:
+    name:
+      - mariadb-backup
+      - mariadb-server
+    state: present
+    update_cache: yes
+
+- name: Configure MariaDB service limits
+  become: true
+  template:
+    src: etc/systemd/system/mariadb.service.d/limits.conf.j2
+    dest: /etc/systemd/system/mariadb.service.d/limits.conf
+    mode: 0644
+  notify: Restart MariaDB
+
+- name: Run handlers
+  meta: flush_handlers
+
+- name: Configure MariaDB
+  become: true
+  template:
+    src: etc/mysql/mariadb.conf.d/server.cnf.j2
+    dest: /etc/mysql/mariadb.conf.d/z-server.cnf
+    mode: 0644
+
+- name: Start MariaDB
+  become: true
+  service:
+    name: mariadb
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Configure mariabackup SST user
+  become: true
+  mysql_user:
+    name: mysql
+    login_unix_socket: /var/run/mysqld/mysqld.sock
+    priv: "*.*:RELOAD,PROCESS,LOCK TABLES,REPLICATION CLIENT"
+  changed_when: false
+  # https://mariadb.com/kb/en/grant/#replication-client
+  # However you cannot use BINLOG MONITOR to grant the privilege...
+
+- name: Copy backup scripts
+  become: true
+  copy:
+    src: "{{ item }}"
+    dest: /usr/local/bin
+    owner: mysql
+    group: mysql
+    mode: 0700
+  with_fileglob:
+    - usr/local/bin/galera-*-backup
+
+- name: Create backup target directory
+  become: true
+  file:
+    path: /var/mariadb
+    state: directory
+    owner: mysql
+    group: mysql
+    mode: 0700
+
+- name: Configure full backup cron job
+  become: true
+  cron:
+    name: Galera full backup
+    minute: "{{ galera_full_backup.minute | default(omit) }}"
+    hour: "{{ galera_full_backup.hour | default(omit) }}"
+    day: "{{ galera_full_backup.day | default(omit) }}"
+    weekday: "{{ galera_full_backup.weekday | default(omit) }}"
+    month: "{{ galera_full_backup.month | default(omit) }}"
+    state: "{{ galera_full_backup.state | default(omit) }}"
+    user: mysql
+    job: /usr/local/bin/galera-full-backup
+  delegate_to: "{{ galera_full_backup.host }}"
+  run_once: true
+  when: galera_full_backup.keys() | length > 0
+
+- name: Configure incremental backup cron job
+  become: true
+  cron:
+    name: Galera incremental backup
+    minute: "{{ galera_incremental_backup.minute | default(omit) }}"
+    hour: "{{ galera_incremental_backup.hour | default(omit) }}"
+    day: "{{ galera_incremental_backup.day | default(omit) }}"
+    weekday: "{{ galera_incremental_backup.weekday | default(omit) }}"
+    month: "{{ galera_incremental_backup.month | default(omit) }}"
+    state: "{{ galera_incremental_backup.state | default(omit) }}"
+    user: mysql
+    job: /usr/local/bin/galera-incremental-backup
+  delegate_to: "{{ galera_incremental_backup.host }}"
+  run_once: true
+  when: galera_incremental_backup.keys() | length > 0
+
+- name: Check if bootstraped
+  become: true
+  shell: mysql -S /run/mysqld/mysqld.sock -NBe "SHOW STATUS LIKE 'wsrep_cluster_size';" | awk '{ print $2 }'
+  register: wsrep_cluster_size
+  check_mode: false
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ groups[galera_cluster_group] | first }}"
+
+- name: Set bootstrap fact
+  set_fact:
+    bootstrap: "{{ wsrep_cluster_size.stdout | int == 0 | bool }}"
+
+- name: Stop MariaDB on first node
+  become: true
+  service:
+    name: mariadb
+    state: stopped
+    enabled: true
+    daemon_reload: true
+  when:
+    - inventory_hostname == groups[galera_cluster_group] | first
+    - bootstrap | bool
+
+- name: Configure Galera on first node
+  become: true
+  template:
+    src: etc/mysql/mariadb.conf.d/galera.cnf.j2
+    dest: /etc/mysql/mariadb.conf.d/z-galera.cnf
+    mode: 0644
+    force: no
+  when:
+    - inventory_hostname == groups[galera_cluster_group] | first
+
+- name: Bootstrap cluster
+  become: true
+  command: galera_new_cluster
+  args:
+    creates: /var/lib/mysql/grastate.dat
+  run_once: true
+  delegate_to: "{{ groups[galera_cluster_group] | first }}"
+
+- name: Wait for bootstrap
+  become: true
+  shell: mysql -S /run/mysqld/mysqld.sock -NBe "SHOW STATUS LIKE 'wsrep_cluster_size';" | awk '{ print $2 }'
+  register: wsrep_cluster_size
+  check_mode: false
+  until: wsrep_cluster_size.stdout == "1"
+  run_once: true
+  delegate_to: "{{ groups[galera_cluster_group] | first }}"
+  when: bootstrap | bool
+
+- name: Set bootstrap fact
+  set_fact:
+    bootstrap: false
+
+- name: Configure Galera on other nodes
+  become: true
+  template:
+    src: etc/mysql/mariadb.conf.d/galera.cnf.j2
+    dest: /etc/mysql/mariadb.conf.d/z-galera.cnf
+    mode: 0644
+  register: configure_other_nodes
+  when:
+    - inventory_hostname != groups[galera_cluster_group] | first
+    - groups[galera_cluster_group] | length > 1
+
+- name: Start MariaDB on other nodes
+  become: true
+  service:
+    name: mariadb
+    state: restarted
+    enabled: true
+    daemon_reload: true
+  when:
+    - inventory_hostname != groups[galera_cluster_group] | first
+    - groups[galera_cluster_group] | length > 1
+    - configure_other_nodes.changed
+
+- name: Wait for other nodes to join cluster
+  become: true
+  shell: mysql -S /run/mysqld/mysqld.sock -NBe "SHOW STATUS LIKE 'wsrep_cluster_size';" | awk '{ print $2 }'
+  register: wsrep_cluster_size
+  check_mode: false
+  until: wsrep_cluster_size.stdout == groups[galera_cluster_group] | length | string
+  run_once: true
+  delegate_to: "{{ groups[galera_cluster_group] | first }}"
+  when: configure_other_nodes.changed
+
+- name: Configure Galera on first node
+  become: true
+  template:
+    src: etc/mysql/mariadb.conf.d/galera.cnf.j2
+    dest: /etc/mysql/mariadb.conf.d/z-galera.cnf
+    mode: 0644
+  register: configure_first_node
+  when:
+    - inventory_hostname == groups[galera_cluster_group] | first
+    - groups[galera_cluster_group] | length > 1
+
+- name: Restart MariaDB on first node
+  become: true
+  service:
+    name: mariadb
+    state: restarted
+    enabled: true
+    daemon_reload: true
+  when:
+    - inventory_hostname == groups[galera_cluster_group] | first
+    - groups[galera_cluster_group] | length > 1
+    - configure_first_node.changed

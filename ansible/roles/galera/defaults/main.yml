@@ -1,0 +1,4 @@
+galera_cluster_group: "galera_cluster_group"
+galera_limit_no_file: 32184
+galera_full_backup: {}
+galera_incremental_backup: {}

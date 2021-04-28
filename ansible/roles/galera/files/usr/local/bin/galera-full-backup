@@ -1,0 +1,9 @@
+#!/bin/bash
+
+set -e
+set -u
+
+basedir=/var/mariadb
+target_dir="${basedir}/full-$(date +%FT%H:%M)"
+
+mariabackup --backup --galera-info --target-dir "${target_dir}" --user mysql

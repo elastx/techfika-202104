@@ -1,0 +1,175 @@
+---
+- name: Create
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  no_log: "{{ molecule_no_log }}"
+  vars:
+    ssh_user: ubuntu
+    ssh_port: 22
+    keypair_path: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}/ssh_key"
+  tasks:
+
+    - name: Create galera security group
+      os_security_group:
+        name: galera
+        state: present
+
+    - name: Create galera security group ssh rule
+      os_security_group_rule:
+        security_group: galera
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: "0.0.0.0/0"
+        protocol: tcp
+
+    - name: Create galera security group trust rule
+      os_security_group_rule:
+        security_group: galera
+        remote_group: galera
+
+    - name: Create galera keypair
+      os_keypair:
+        name: galera
+        state: present
+      register: keypair
+
+    - name: Persist the keypair
+      copy:
+        dest: "{{ keypair_path }}"
+        content: "{{ keypair.key.private_key }}"
+        mode: 0600
+      when: keypair.changed
+
+    - name: Get auth token and service catalog
+      os_auth:
+      register: auth
+
+    - name: Set public_neutron_url fact
+      set_fact:
+        public_neutron_url: "{{ auth | json_query(\"ansible_facts.service_catalog[?name=='neutron'].endpoints[0].url\") | first }}"
+
+    - name: List routers
+      uri:
+        url: "{{ public_neutron_url }}/v2.0/routers"
+        headers:
+          Accept: application/json
+          X-Auth-Token: "{{ auth.ansible_facts.auth_token }}"
+      register: routers
+
+    - name: Set router_id fact
+      set_fact:
+        router_id: "{{ routers.json.routers[0].id }}"
+      when: routers.json.routers | length > 0
+
+    - name: Create galera network
+      os_network:
+        name: galera
+        state: present
+      register: network
+
+    - name: Create galera subnet
+      os_subnet:
+        name: galera
+        state: present
+        cidr: "10.100.1.0/24"
+        dns_nameservers:
+          - 1.1.1.1
+          - 1.0.0.1
+        network_name: galera
+        host_routes:
+          - destination: 0.0.0.0/0
+            nexthop: 10.100.1.1
+      register: subnet
+
+    - name: Add subnet to router
+      uri:
+        url: "{{ public_neutron_url }}/v2.0/routers/{{ router_id }}/add_router_interface"
+        method: PUT
+        body:
+          subnet_id: "{{ subnet.id }}"
+        body_format: json
+        headers:
+          X-Auth-Token: "{{ auth.ansible_facts.auth_token }}"
+        status_code:
+          - 200
+          - 400
+      register: router
+      changed_when: router.status == 200
+      failed_when:
+        - router.status != 200
+        - router.status == 400 and "Router already has a port on subnet" not in router.json.NeutronError.message
+      when: router_id is defined
+
+    - name: Create galera router
+      os_router:
+        name: galera
+        state: present
+        network: elx-public1
+        interfaces:
+          - galera
+      when: |
+        routers.json.routers | length == 0
+
+    - name: Create galera instance(s)
+      os_server:
+        name: "{{ item.name }}"
+        image: "{{ item.image }}"
+        key_name: galera
+        flavor: "{{ item.flavor | default('v1-standard-1') }}"
+        security_groups:
+          - default
+          - galera
+        network: galera
+      register: server
+      with_items: "{{ molecule_yml.platforms }}"
+
+    - name: Create MariaDB volume(s)
+      os_volume:
+        display_name: "db_volume-{{ item.openstack.name }}"
+        size: 10
+        availability_zone: "{{ item.openstack.az }}"
+      loop: "{{ server.results }}"
+      loop_control:
+        index_var: idx
+
+    - name: Attach MariaDB volume(s)
+      os_server_volume:
+        server: "{{ item.openstack.id }}"
+        volume: "db_volume-{{ item.openstack.name }}"
+        device: /dev/vdb
+      loop: "{{ server.results }}"
+      loop_control:
+        index_var: idx
+
+    - when: server.changed | default(false) | bool
+      block:
+        - name: Populate instance config dict
+          set_fact:
+            instance_conf_dict: {
+              'instance': "{{ item.openstack.name }}",
+              'address': "{{ item.openstack.accessIPv4 }}",
+              'user': "{{ ssh_user }}",
+              'port': "{{ ssh_port }}",
+              'identity_file': "{{ keypair_path }}", }
+          loop: "{{ server.results }}"
+          loop_control:
+            index_var: idx
+          register: instance_config_dict
+
+        - name: Convert instance config dict to a list
+          set_fact:
+            instance_conf: "{{ instance_config_dict.results | map(attribute='ansible_facts.instance_conf_dict') | list }}"
+
+        - name: Dump instance config
+          copy:
+            content: "{{ instance_conf | to_json | from_json | molecule_to_yaml | molecule_header }}"
+            dest: "{{ molecule_instance_config }}"
+
+    - name: Wait for SSH
+      wait_for:
+        port: "{{ ssh_port }}"
+        host: "{{ item.address }}"
+        search_regex: SSH
+        delay: 10
+      with_items: "{{ lookup('file', molecule_instance_config) | molecule_from_yaml }}"

@@ -1,0 +1,40 @@
+---
+dependency:
+  name: galaxy
+driver:
+  name: delegated
+platforms:
+  - name: galera1
+    image: ubuntu-20.04-server-latest
+    flavor: v1-standard-2
+    groups:
+      - galera_cluster1
+  - name: galera2
+    image: ubuntu-20.04-server-latest
+    flavor: v1-standard-2
+    groups:
+      - galera_cluster1
+  - name: galera3
+    image: ubuntu-20.04-server-latest
+    flavor: v1-standard-2
+    groups:
+      - galera_cluster1
+provisioner:
+  name: ansible
+  inventory:
+    group_vars:
+      galera_cluster1:
+        galera_cluster_group: galera_cluster1
+        galera_full_backup:
+          weekday: "*"
+          hour: "3"
+          minute: "0"
+          host: galera1
+        galera_incremental_backup:
+          weekday: "*"
+          hour: "5,7,8"
+          minute: "0"
+          host: galera1
+  log: true
+verifier:
+  name: ansible

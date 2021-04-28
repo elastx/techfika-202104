@@ -1,0 +1,10 @@
+#!/bin/bash
+
+set -e
+set -u
+
+basedir=/var/mariadb
+incremental_basedir="${basedir}/$(ls -1rt "${basedir}" | tail -1)"
+target_dir="${basedir}/incremental-$(date +%FT%H:%M)"
+
+mariabackup --backup --galera-info --incremental-basedir="${incremental_basedir}" --target-dir "${target_dir}" --user mysql

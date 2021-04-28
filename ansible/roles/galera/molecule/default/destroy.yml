@@ -1,0 +1,115 @@
+---
+- name: Destroy
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  no_log: "{{ molecule_no_log }}"
+  tasks:
+    - name: Destroy galera instance(s)
+      os_server:
+        name: "{{ item.name }}"
+        state: absent
+        delete_fip: true
+      with_items: "{{ molecule_yml.platforms }}"
+      register: server
+
+    - name: Destroy MariaDB volume(s)
+      os_volume:
+        display_name: "db_volume-{{ item.name }}"
+        state: absent
+      with_items: "{{ molecule_yml.platforms }}"
+
+    - name: Remove galera security group
+      os_security_group:
+        name: galera
+        state: absent
+
+    - name: Destroy galera keypair
+      os_keypair:
+        name: galera
+        state: absent
+
+    - name: Get subnet info
+      os_subnet:
+        name: galera
+        state: present
+        cidr: "10.100.1.0/24"
+        dns_nameservers:
+          - 1.1.1.1
+          - 1.0.0.1
+        network_name: galera
+        host_routes:
+          - destination: 0.0.0.0/0
+            nexthop: 10.100.1.1
+      register: subnet
+      failed_when: false
+
+    - name: Get auth token and service catalog
+      os_auth:
+      register: auth
+
+    # TODO: Figure out how to select based on interface == 'public'
+    - name: Set public_neutron_url fact
+      set_fact:
+        public_neutron_url: "{{ auth | json_query(\"ansible_facts.service_catalog[?name=='neutron'].endpoints[0].url\") | first }}"
+
+    - name: List routers
+      uri:
+        url: "{{ public_neutron_url }}/v2.0/routers"
+        headers:
+          Accept: application/json
+          X-Auth-Token: "{{ auth.ansible_facts.auth_token }}"
+      register: routers
+
+    - name: Set router_id fact
+      set_fact:
+        router_id: "{{ routers.json.routers[0].id }}"
+      when: routers.json.routers | length > 0
+
+    - name: Delete subnet from router
+      uri:
+        url: "{{ public_neutron_url }}/v2.0/routers/{{ router_id }}/remove_router_interface"
+        method: PUT
+        body:
+          subnet_id: "{{ subnet.id }}"
+        body_format: json
+        headers:
+          X-Auth-Token: "{{ auth.ansible_facts.auth_token }}"
+        status_code:
+          - 200
+          - 400
+      register: router
+      changed_when: router.status == 200
+      failed_when:
+        - router.status != 200
+        - router.status == 400 and "Router already has a port on subnet" not in router.json.NeutronError.message
+      when:
+        - router_id is defined
+        - subnet.id is defined
+
+    - name: Destroy galera router
+      os_router:
+        name: galera
+        state: absent
+      when: |
+        router_id is defined
+
+    - name: Destroy galera subnet
+      os_subnet:
+        name: galera
+        state: absent
+
+    - name: Destroy galera network
+      os_network:
+        name: galera
+        state: absent
+
+    - name: Populate instance config
+      set_fact:
+        instance_conf: {}
+
+    - name: Dump instance config
+      copy:
+        content: "{{ instance_conf | to_json | from_json | molecule_to_yaml | molecule_header }}"
+        dest: "{{ molecule_instance_config }}"
+      when: server.changed | default(false) | bool

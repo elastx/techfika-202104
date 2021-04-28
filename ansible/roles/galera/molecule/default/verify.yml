@@ -1,0 +1,36 @@
+---
+- name: Verify
+  hosts: all
+  tasks:
+  - name: Check wsrep_cluster_size fact
+    become: true
+    shell: mariadb -NBe "SHOW GLOBAL STATUS LIKE 'wsrep_cluster_size';" | awk '{ print $2 }'
+    register: wsrep_cluster_size
+
+  - name: Check wsrep_cluster_size equals group size
+    assert:
+      that: "groups['galera_cluster1'] | length | string == wsrep_cluster_size.stdout"
+
+  - name: Write data on first node
+    become: true
+    command: >
+      mariadb -e
+      'CREATE DATABASE IF NOT EXISTS test;
+      CREATE TABLE test.names (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255));
+      INSERT INTO test.names(name) VALUES ("Kalle Anka");'
+    delegate_to: "{{ groups['galera_cluster1'] | first }}"
+    run_once: true
+
+  - name: Read data
+    become: true
+    command: mariadb -NBe 'SELECT * FROM test.names;'
+    register: replication
+    #    delegate_to: "{{ groups['galera_cluster1'] | last }}"
+    #    run_once: true
+
+  - name: Check replication works
+    assert:
+      that: "'Kalle Anka' in replication.stdout"
+      #    delegate_to: "{{ groups['galera_cluster1'] | last }}"
+      #    run_once: true
+

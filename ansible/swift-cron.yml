@@ -1,0 +1,41 @@
+- hosts: all
+  tasks:
+    - name: Install swift client
+      become: true
+      apt:
+        name: python3-swiftclient
+        state: present
+
+    - name: Create openrc
+      become: true
+      template:
+        src: home/mysql/openrc.j2
+        dest: /home/mysql/openrc
+        mode: 0600
+        owner: mysql
+        group: mysql
+
+    - name: Create swift transfer script
+      become: true
+      copy:
+        src: usr/local/bin/swift-transfer
+        dest: /usr/local/bin
+        mode: 0700
+        owner: mysql
+        group: mysql
+
+    - name: Configure cron jobs
+      become: true
+      cron:
+        name: "Swift transfer {{ idx }}"
+        minute: "{{ item.minute | default(omit) }}"
+        hour: "{{ item.hour | default(omit) }}"
+        day: "{{ item.day | default(omit) }}"
+        weekday: "{{ item.weekday | default(omit) }}"
+        month: "{{ item.month | default(omit) }}"
+        state: "{{ item.state | default(omit) }}"
+        user: mysql
+        job: /usr/local/bin/swift-transfer
+      loop: "{{ swift_cron | default([]) }}"
+      loop_control:
+        index_var: idx

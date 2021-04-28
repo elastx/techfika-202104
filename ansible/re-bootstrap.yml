@@ -1,0 +1,100 @@
+- hosts: all
+  gather_facts: false
+  handlers:
+    - name: Restart MariaDB
+      include_tasks: roles/galera/handlers/main.yml
+  tasks:
+    - name: Check state of MariaDB service
+      service_facts:
+      register: services_state
+
+    - name: Assert MariaDB is stopped on all nodes
+      assert:
+        that: services_state.ansible_facts.services['mariadb.service'].state == "stopped"
+
+    - name: Record seqno from nodes
+      become: true
+      command: awk '/seqno/ { print $2 }' /var/lib/mysql/grastate.dat
+      register: seqno_result
+      changed_when: false
+      check_mode: false
+      tags:
+        - seqno
+
+    - name: Set seqno fact
+      set_fact:
+        seqno: "{{ seqno_result.stdout | int }}"
+      tags:
+        - seqno
+
+    - name: Assert that all seqno:s are not -1
+      assert:
+        that: "{{ groups[galera_cluster_group] | map('extract', hostvars, 'seqno') | difference(['-1']) | list | length > 0 }}"
+      delegate_to: localhost
+      run_once: true
+      tags:
+        - seqno
+
+    - name: Set most_advanced_node fact
+      set_fact:
+        most_advanced_node: "{{ groups[galera_cluster_group] | sort('seqno' | int) | last }}"
+      delegate_to: localhost
+      run_once: true
+      tags:
+        - seqno
+
+    - name: Set most_advanced_node fact
+      set_fact:
+        most_advanced_node: "{{ groups[galera_cluster_group] | first }}"
+      delegate_to: localhost
+      run_once: true
+      tags:
+        - never
+
+    - name: Create bootstrap configuration
+      become: true
+      copy:
+        src: roles/galera/files/etc/mysql/mariadb.conf.d/z-galera.cnf
+        dest: /etc/mysql/mariadb.conf.d
+        mode: 0644
+      when: inventory_hostname == most_advanced_node
+
+    - name: Bootstrap cluster
+      become: true
+      command: galera_new_cluster
+      args:
+        creates: /var/lib/mysql/grastate.dat
+      when: inventory_hostname == most_advanced_node
+      notify: Restart MariaDB
+
+    - name: Start MariaDB
+      become: true
+      throttle: 1
+      service:
+        name: mariadb
+        state: started
+        enabled: true
+      when: inventory_hostname == most_advanced_node
+
+    - name: Start MariaDB
+      become: true
+      throttle: 1
+      service:
+        name: mariadb
+        state: started
+        enabled: true
+      when: inventory_hostname != most_advanced_node
+
+    - name: Gather facts
+      setup:
+
+    - name: Configure Galera
+      become: true
+      template:
+        src: roles/galera/templates/etc/mysql/mariadb.conf.d/galera.cnf.j2
+        dest: /etc/mysql/mariadb.conf.d/z-galera.cnf
+        mode: 0644
+      notify: Restart MariaDB
+      when:
+        - inventory_hostname == most_advanced_node
+        - groups[galera_cluster_group] | length > 1

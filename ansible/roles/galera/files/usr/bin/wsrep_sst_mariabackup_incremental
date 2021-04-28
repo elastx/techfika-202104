@@ -1,0 +1,5 @@
+#!/bin/sh
+
+today="$(date +%F)"
+
+mariabackup --backup --target-dir=/var/mariadb/incremental-"${today}" --incremental-basedir=/var/mariadb/backup/ --user=mysql --galera-info

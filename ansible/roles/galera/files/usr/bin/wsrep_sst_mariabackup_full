@@ -1,0 +1,3 @@
+#!/bin/sh
+
+mariabackup --backup --target-dir=/var/mariadb/backup/ --user=mysql --galera-info
